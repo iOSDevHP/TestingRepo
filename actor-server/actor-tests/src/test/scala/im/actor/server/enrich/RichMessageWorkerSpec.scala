@@ -1,0 +1,191 @@
+package im.actor.server.enrich
+
+import im.actor.server.acl.ACLUtils
+import im.actor.server.group.{ GroupProcessorRegion, GroupOffice }
+import im.actor.server.user.{ UserProcessorRegion, UserOffice }
+
+import scala.util.Random
+
+import com.amazonaws.auth.EnvironmentVariableCredentialsProvider
+import slick.dbio.{ DBIO, DBIOAction, Effect, NoStream }
+
+import im.actor.api.rpc.Implicits._
+import im.actor.api.rpc.files.FastThumb
+import im.actor.api.rpc.messaging.{ DocumentExPhoto, DocumentMessage, TextMessage, UpdateMessageContentChanged }
+import im.actor.api.rpc.peers.PeerType
+import im.actor.api.rpc.{ ClientData, peers }
+import im.actor.server._
+import im.actor.server.api.rpc.service.groups.{ GroupInviteConfig, GroupsServiceImpl }
+import im.actor.server.api.rpc.service.messaging
+import im.actor.server.presences.{ GroupPresenceManager, PresenceManager }
+import im.actor.server.social.SocialManager
+
+import scala.util.Random
+
+class RichMessageWorkerSpec
+  extends BaseAppSuite
+  with GroupsServiceHelpers
+  with MessageParsing
+  with ImplicitGroupRegions
+  with ImplicitSessionRegionProxy
+  with ImplicitSequenceService
+  with SequenceMatchers
+  with ImplicitAuthService {
+
+  behavior of "Rich message updater"
+
+  it should "change text message to document message when image url in private chat" in t.privat.changeMessagePrivate()
+
+  it should "change text message to document message when image url in group chat" in t.group.changeMessageGroup()
+
+  it should "not change message without image url in private chat" in t.privat.dontChangePrivate()
+
+  it should "not change message without image url in group chat" in t.group.dontChangeGroup()
+
+  object t {
+
+    val ThumbMinSize = 90
+    implicit val ec = system.dispatcher
+
+    implicit val sessionRegion = buildSessionRegionProxy()
+    implicit val socialManagerRegion = SocialManager.startRegion()
+    implicit val presenceManagerRegion = PresenceManager.startRegion()
+    implicit val groupPresenceManagerRegion = GroupPresenceManager.startRegion()
+
+    val groupInviteConfig = GroupInviteConfig("http://actor.im")
+
+    implicit val service = messaging.MessagingServiceImpl(mediator)
+    implicit val groupsService = new GroupsServiceImpl(groupInviteConfig)
+
+    RichMessageWorker.startWorker(RichMessageConfig(5 * 1024 * 1024), mediator)
+
+    object privat {
+      val (user1, authId, _) = createUser()
+      val sessionId = createSessionId()
+      implicit val clientData = ClientData(authId, sessionId, Some(user1.id))
+
+      val (user2, _, _) = createUser()
+      val user2Model = getUserModel(user2.id)
+      val user2AccessHash = ACLUtils.userAccessHash(authId, user2.id, user2Model.accessSalt)
+      val user2Peer = peers.OutPeer(PeerType.Private, user2.id, user2AccessHash)
+
+      def dontChangePrivate() = {
+
+        val resp1 = whenReady(service.handleSendMessage(user2Peer, Random.nextLong(), TextMessage(NonImages.mixedText, Vector.empty, None)))(_.toOption.get)
+        expectNoUpdate(resp1.seq, resp1.state, UpdateMessageContentChanged.header)
+
+        val resp2 = whenReady(service.handleSendMessage(user2Peer, Random.nextLong(), TextMessage(NonImages.plainText, Vector.empty, None)))(_.toOption.get)
+        expectNoUpdate(resp2.seq, resp2.state, UpdateMessageContentChanged.header)
+
+        val resp3 = whenReady(service.handleSendMessage(user2Peer, Random.nextLong(), TextMessage(NonImages.nonImageUrl, Vector.empty, None)))(_.toOption.get)
+        expectNoUpdate(resp2.seq, resp2.state, UpdateMessageContentChanged.header)
+
+      }
+
+      def changeMessagePrivate() = {
+
+        {
+          val image = Images.noNameHttp
+          val (thumbW, thumbH) = image.getThumbWH(ThumbMinSize)
+          val resp = whenReady(service.handleSendMessage(user2Peer, Random.nextLong(), TextMessage(image.url, Vector.empty, None)))(_.toOption.get)
+
+          expectUpdate[UpdateMessageContentChanged](resp.seq, resp.state, UpdateMessageContentChanged.header, Some(1)) { update ⇒
+            update.message should matchPattern {
+              case DocumentMessage(_, _, image.contentLength, _, image.mimeType, Some(FastThumb(`thumbW`, `thumbH`, _)), Some(DocumentExPhoto(image.w, image.h))) ⇒
+            }
+          }
+        }
+
+        {
+          val image = Images.withNameHttp
+          val (thumbW, thumbH) = image.getThumbWH(ThumbMinSize)
+          val imageName = image.fileName.get
+          val resp = whenReady(service.handleSendMessage(user2Peer, Random.nextLong(), TextMessage(image.url, Vector.empty, None)))(_.toOption.get)
+
+          expectUpdate[UpdateMessageContentChanged](resp.seq, resp.state, UpdateMessageContentChanged.header, Some(1)) { update ⇒
+            update.message should matchPattern {
+              case DocumentMessage(_, _, image.contentLength, `imageName`, image.mimeType, Some(FastThumb(`thumbW`, `thumbH`, _)), Some(DocumentExPhoto(image.w, image.h))) ⇒
+            }
+          }
+        }
+
+        {
+          val image = Images.noNameHttps
+          val (thumbW, thumbH) = image.getThumbWH(ThumbMinSize)
+          val resp = whenReady(service.handleSendMessage(user2Peer, Random.nextLong(), TextMessage(image.url, Vector.empty, None)))(_.toOption.get)
+
+          expectUpdate[UpdateMessageContentChanged](resp.seq, resp.state, UpdateMessageContentChanged.header, Some(1)) { update ⇒
+            update.message should matchPattern {
+              case DocumentMessage(_, _, image.contentLength, _, image.mimeType, Some(FastThumb(`thumbW`, `thumbH`, _)), Some(DocumentExPhoto(image.w, image.h))) ⇒
+            }
+          }
+        }
+      }
+    }
+
+    object group {
+      val (user1, authId1, _) = createUser()
+      val (user2, authId2, _) = createUser()
+      val (user3, authId3, _) = createUser()
+
+      val sessionId = createSessionId()
+      implicit val clientData = ClientData(authId1, sessionId, Some(user1.id))
+
+      val groupOutPeer = createGroup("Test group", Set(user2.id, user3.id)).groupPeer
+
+      def dontChangeGroup() = {
+
+        val resp1 = whenReady(service.handleSendMessage(groupOutPeer.asOutPeer, Random.nextLong(), TextMessage(NonImages.mixedText, Vector.empty, None)))(_.toOption.get)
+        expectNoUpdate(resp1.seq, resp1.state, UpdateMessageContentChanged.header)
+
+        val resp2 = whenReady(service.handleSendMessage(groupOutPeer.asOutPeer, Random.nextLong(), TextMessage(NonImages.plainText, Vector.empty, None)))(_.toOption.get)
+        expectNoUpdate(resp2.seq, resp2.state, UpdateMessageContentChanged.header)
+
+        val resp3 = whenReady(service.handleSendMessage(groupOutPeer.asOutPeer, Random.nextLong(), TextMessage(NonImages.nonImageUrl, Vector.empty, None)))(_.toOption.get)
+        expectNoUpdate(resp3.seq, resp3.state, UpdateMessageContentChanged.header)
+      }
+
+      def changeMessageGroup() = {
+
+        {
+          val image = Images.noNameHttp
+          val (thumbW, thumbH) = image.getThumbWH(ThumbMinSize)
+          val resp = whenReady(service.handleSendMessage(groupOutPeer.asOutPeer, Random.nextLong(), TextMessage(image.url, Vector.empty, None)))(_.toOption.get)
+
+          expectUpdate[UpdateMessageContentChanged](resp.seq, resp.state, UpdateMessageContentChanged.header, Some(1)) { update ⇒
+            update.message should matchPattern {
+              case DocumentMessage(_, _, image.contentLength, _, image.mimeType, Some(FastThumb(`thumbW`, `thumbH`, _)), Some(DocumentExPhoto(image.w, image.h))) ⇒
+            }
+          }
+        }
+
+        {
+          val image = Images.withNameHttp
+          val (thumbW, thumbH) = image.getThumbWH(ThumbMinSize)
+          val imageName = image.fileName.get
+          val resp = whenReady(service.handleSendMessage(groupOutPeer.asOutPeer, Random.nextLong(), TextMessage(image.url, Vector.empty, None)))(_.toOption.get)
+
+          expectUpdate[UpdateMessageContentChanged](resp.seq, resp.state, UpdateMessageContentChanged.header, Some(1)) { update ⇒
+            update.message should matchPattern {
+              case DocumentMessage(_, _, image.contentLength, `imageName`, image.mimeType, Some(FastThumb(`thumbW`, `thumbH`, _)), Some(DocumentExPhoto(image.w, image.h))) ⇒
+            }
+          }
+        }
+
+        {
+          val image = Images.noNameHttps
+          val (thumbW, thumbH) = image.getThumbWH(ThumbMinSize)
+          val resp = whenReady(service.handleSendMessage(groupOutPeer.asOutPeer, Random.nextLong(), TextMessage(image.url, Vector.empty, None)))(_.toOption.get)
+
+          expectUpdate[UpdateMessageContentChanged](resp.seq, resp.state, UpdateMessageContentChanged.header, Some(1)) { update ⇒
+            update.message should matchPattern {
+              case DocumentMessage(_, _, image.contentLength, _, image.mimeType, Some(FastThumb(`thumbW`, `thumbH`, _)), Some(DocumentExPhoto(image.w, image.h))) ⇒
+            }
+          }
+        }
+      }
+    }
+
+  }
+
+}
