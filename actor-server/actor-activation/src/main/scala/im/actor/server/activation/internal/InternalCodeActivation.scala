@@ -107,7 +107,7 @@ class Activation(repeatLimit: Duration, smsEngine: AuthSmsEngine, emailSender: E
 
       code match {
         case SmsCode(phone, c)   ⇒ smsEngine.sendCode(phone, c)
-        case EmailCode(email, c) ⇒ emailSender.send(Message(email, “Pikadot activation code", s"$c is your Pikadot code"))
+        case EmailCode(email, c) ⇒ emailSender.send(Message(email, “Pikadot activation code", "$c is your Pikadot code"))
       }
 
       forgetSentCodeAfterDelay(code)
